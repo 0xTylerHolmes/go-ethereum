@@ -1500,6 +1500,12 @@ const (
 	journalPerDeltaCost uint64 = 10
 )
 
+// journalStateDB is the interface for accessing journal entries from StateDB.
+type journalStateDB interface {
+	StateDB
+	JournalEntries() []state.JournalEntry
+}
+
 func (c *journalRecordsContract) RequiredGas(sdb StateDB, input []byte) uint64 {
 	if len(input) < 2 {
 		return journalBaseCost
@@ -1507,17 +1513,25 @@ func (c *journalRecordsContract) RequiredGas(sdb StateDB, input []byte) uint64 {
 	if input[1] == journalCountOperation {
 		return journalBaseCost + journalCountCost
 	}
-	hsdb, ok := sdb.(interface{ BuildJournalRecords() *state.JournalRecords })
+	jsdb, ok := sdb.(journalStateDB)
 	if !ok {
 		return journalBaseCost
 	}
-	records := hsdb.BuildJournalRecords()
 	var count int
+	entries := jsdb.JournalEntries()
 	switch input[0] {
 	case journalBalancesField:
-		count = len(records.BalanceDeltas)
+		for _, e := range entries {
+			if _, ok := e.(*state.BalanceChange); ok {
+				count++
+			}
+		}
 	case journalStorageField:
-		count = len(records.StorageDeltas)
+		for _, e := range entries {
+			if _, ok := e.(*state.StorageChange); ok {
+				count++
+			}
+		}
 	default:
 		return journalBaseCost
 	}
@@ -1535,43 +1549,75 @@ func (c *journalRecordsContract) Run(sdb StateDB, input []byte) ([]byte, error) 
 	if operation != journalCountOperation && operation != journalListOperation {
 		return nil, errors.New("invalid operation")
 	}
-	hsdb, ok := sdb.(interface{ BuildJournalRecords() *state.JournalRecords })
+	jsdb, ok := sdb.(journalStateDB)
 	if !ok {
 		return nil, errors.New("unsupported StateDB")
 	}
-	records := hsdb.BuildJournalRecords()
+	entries := jsdb.JournalEntries()
 	switch operation {
 	case journalCountOperation:
-		return c.count(records, field), nil
+		return c.count(entries, field), nil
 	case journalListOperation:
-		return c.list(records, field), nil
+		return c.list(entries, field), nil
 	}
 	return nil, errors.New("invalid operation")
 }
 
-func (c *journalRecordsContract) count(records *state.JournalRecords, field uint8) []byte {
+func (c *journalRecordsContract) count(entries []state.JournalEntry, field uint8) []byte {
 	var n uint64
-	switch field {
-	case journalBalancesField:
-		n = uint64(len(records.BalanceDeltas))
-	case journalStorageField:
-		n = uint64(len(records.StorageDeltas))
+	for _, e := range entries {
+		switch field {
+		case journalBalancesField:
+			if _, ok := e.(*state.BalanceChange); ok {
+				n++
+			}
+		case journalStorageField:
+			if _, ok := e.(*state.StorageChange); ok {
+				n++
+			}
+		}
 	}
-	result := make([]byte, 32)
-	for i := 0; i < 8; i++ {
-		result[31-i] = byte(n >> (8 * i))
-	}
+	result := make([]byte, 8)
+	binary.BigEndian.PutUint64(result, n)
 	return result
 }
 
-func (c *journalRecordsContract) list(records *state.JournalRecords, field uint8) []byte {
+func (c *journalRecordsContract) list(entries []state.JournalEntry, field uint8) []byte {
 	switch field {
 	case journalBalancesField:
-		return records.EncodeBalanceDeltas()
+		return encodeBalanceChanges(entries)
 	case journalStorageField:
-		return records.EncodeStorageDeltas()
+		return encodeStorageChanges(entries)
 	}
 	return nil
+}
+
+// encodeBalanceChanges encodes balance changes into packed bytes.
+// Each entry is 64 bytes: address (32) + prev_balance (32).
+func encodeBalanceChanges(entries []state.JournalEntry) []byte {
+	var encoded []byte
+	for _, e := range entries {
+		if bc, ok := e.(*state.BalanceChange); ok {
+			encoded = append(encoded, common.LeftPadBytes(bc.Account.Bytes(), 32)...)
+			prevBytes := bc.Prev.Bytes32()
+			encoded = append(encoded, prevBytes[:]...)
+		}
+	}
+	return encoded
+}
+
+// encodeStorageChanges encodes storage changes into packed bytes.
+// Each entry is 96 bytes: address (32) + key (32) + prev_value (32).
+func encodeStorageChanges(entries []state.JournalEntry) []byte {
+	var encoded []byte
+	for _, e := range entries {
+		if sc, ok := e.(*state.StorageChange); ok {
+			encoded = append(encoded, common.LeftPadBytes(sc.Account.Bytes(), 32)...)
+			encoded = append(encoded, sc.Key.Bytes()...)
+			encoded = append(encoded, sc.Prev.Bytes()...)
+		}
+	}
+	return encoded
 }
 
 func (c *journalRecordsContract) Name() string {

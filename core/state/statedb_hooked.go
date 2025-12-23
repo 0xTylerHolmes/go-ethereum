@@ -292,7 +292,7 @@ func (s *hookedStateDB) Finalise(deleteEmptyObjects bool) {
 	}
 }
 
-// BuildJournalRecords returns the current transaction's journal records.
-func (s *hookedStateDB) BuildJournalRecords() *JournalRecords {
-	return s.inner.BuildJournalRecords()
+// JournalEntries returns the current transaction's journal entries.
+func (s *hookedStateDB) JournalEntries() []JournalEntry {
+	return s.inner.JournalEntries()
 }

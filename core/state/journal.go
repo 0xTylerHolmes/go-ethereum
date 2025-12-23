@@ -499,3 +499,23 @@ func (ch accessListAddSlotChange) copy() journalEntry {
 		slot:    ch.slot,
 	}
 }
+
+// temporary public versions
+type JournalEntry interface {
+	exportedJournalEntry()
+}
+
+type BalanceChange struct {
+	Account common.Address
+	Prev    *uint256.Int
+}
+
+func (ch BalanceChange) exportedJournalEntry() {}
+
+type StorageChange struct {
+	Account common.Address
+	Key     common.Hash
+	Prev    common.Hash
+}
+
+func (ch StorageChange) exportedJournalEntry() {}

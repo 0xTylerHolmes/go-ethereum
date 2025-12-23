@@ -176,8 +176,8 @@ func TestJournalRecordsEmpty(t *testing.T) {
 		t.Fatal("unexpected error:", err)
 	}
 
-	if len(ret) != 32 {
-		t.Fatalf("expected 32 bytes for count, got %d bytes", len(ret))
+	if len(ret) != 8 {
+		t.Fatalf("expected 8 bytes for count, got %d bytes", len(ret))
 	}
 	balanceCount := new(big.Int).SetBytes(ret)
 	if balanceCount.Cmp(big.NewInt(0)) != 0 {
@@ -212,7 +212,7 @@ func TestJournalRecordsStaticCall(t *testing.T) {
 
 	// Create a contract that will STATICCALL the journal records precompile
 	// Input: [0x01, 0x01] = BALANCES_FIELD, COUNT_OPERATION
-	// Returns 32 bytes (the count)
+	// Returns 8 bytes (the count as uint64)
 	caller := common.HexToAddress("0xc0de")
 	callerCode := []byte{
 		// Store input header in memory at offset 0
@@ -220,7 +220,7 @@ func TestJournalRecordsStaticCall(t *testing.T) {
 		byte(vm.PUSH1), 0x00, // memory offset
 		byte(vm.MSTORE), // store at offset 0 (right-aligned in 32-byte word)
 		// STATICCALL
-		byte(vm.PUSH1), 0x20, // return size (32 bytes)
+		byte(vm.PUSH1), 0x08, // return size (8 bytes)
 		byte(vm.PUSH1), 0x00, // return offset
 		byte(vm.PUSH1), 0x02, // args size (2 bytes for header)
 		byte(vm.PUSH1), 0x1e, // args offset (30, since MSTORE right-aligns)
@@ -231,11 +231,11 @@ func TestJournalRecordsStaticCall(t *testing.T) {
 		byte(vm.GAS),
 		byte(vm.STATICCALL),
 		byte(vm.POP),
-		byte(vm.PUSH1), 0x20, // size (32 bytes)
+		byte(vm.PUSH1), 0x08, // size (8 bytes)
 		byte(vm.PUSH1), 0x00, // offset
 		byte(vm.PUSH1), 0x00, // destOffset
 		byte(vm.RETURNDATACOPY),
-		byte(vm.PUSH1), 0x20, // size
+		byte(vm.PUSH1), 0x08, // size
 		byte(vm.PUSH1), 0x00, // offset
 		byte(vm.RETURN),
 	)
@@ -246,9 +246,9 @@ func TestJournalRecordsStaticCall(t *testing.T) {
 		t.Fatal("unexpected error:", err)
 	}
 
-	// Expect 32 bytes with zero count (no state changes)
-	if len(ret) != 32 {
-		t.Fatalf("expected 32 bytes return, got %d bytes", len(ret))
+	// Expect 8 bytes with zero count (no state changes)
+	if len(ret) != 8 {
+		t.Fatalf("expected 8 bytes return, got %d bytes", len(ret))
 	}
 
 	balanceCount := new(big.Int).SetBytes(ret)
@@ -293,10 +293,10 @@ func TestJournalRecordsWithBalanceChange(t *testing.T) {
 		t.Errorf("expected address %s, got %s", testAddr.Hex(), deltaAddr.Hex())
 	}
 
-	// Parse value
+	// Parse value (this is the PREVIOUS balance, which was 0 before AddBalance)
 	deltaValue := new(big.Int).SetBytes(ret[32:64])
-	if deltaValue.Cmp(new(big.Int).SetUint64(1000000)) != 0 {
-		t.Errorf("expected delta value 1000000, got %v", deltaValue)
+	if deltaValue.Cmp(big.NewInt(0)) != 0 {
+		t.Errorf("expected previous balance 0, got %v", deltaValue)
 	}
 
 	// Verify storage count is 0
@@ -357,9 +357,11 @@ func TestJournalRecordsWithStorageChange(t *testing.T) {
 		t.Errorf("expected key %s, got %s", key.Hex(), deltaKey.Hex())
 	}
 
+	// Parse value (this is the PREVIOUS storage value, which was 0x0 before SetState)
 	deltaValue := common.BytesToHash(ret[64:96])
-	if deltaValue != value {
-		t.Errorf("expected delta value %s, got %s", value.Hex(), deltaValue.Hex())
+	expectedPrev := common.Hash{} // zero hash
+	if deltaValue != expectedPrev {
+		t.Errorf("expected previous storage value %s, got %s", expectedPrev.Hex(), deltaValue.Hex())
 	}
 }
 
