@@ -33,6 +33,7 @@ import (
 	patched_big "github.com/ethereum/go-bigmodexpfix/src/math/big"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/bitutil"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/blake2b"
@@ -52,6 +53,16 @@ type PrecompiledContract interface {
 	Run(input []byte) ([]byte, error) // Run runs the precompiled contract
 	Name() string
 }
+
+// StatefulPrecompiledContract is an interface for precompiles that need state access.
+type StatefulPrecompiledContract interface {
+	RequiredGas(state StateDB, input []byte) uint64
+	Run(state StateDB, input []byte) ([]byte, error)
+	Name() string
+}
+
+// StatefulPrecompiledContracts contains stateful precompiled contracts.
+type StatefulPrecompiledContracts map[common.Address]StatefulPrecompiledContract
 
 // PrecompiledContracts contains the precompiled contracts supported at the given fork.
 type PrecompiledContracts map[common.Address]PrecompiledContract
@@ -1450,4 +1461,119 @@ func (c *p256Verify) Run(input []byte) ([]byte, error) {
 
 func (c *p256Verify) Name() string {
 	return "P256VERIFY"
+}
+
+// DefaultStatefulPrecompiles contains the default stateful precompiled contracts.
+var DefaultStatefulPrecompiles = StatefulPrecompiledContracts{
+	common.HexToAddress("0xc0ffee"): &journalRecordsContract{},
+}
+
+// RunStatefulPrecompiledContract runs a stateful precompiled contract.
+func RunStatefulPrecompiledContract(p StatefulPrecompiledContract, state StateDB, input []byte,
+	suppliedGas uint64, logger *tracing.Hooks) (ret []byte, remainingGas uint64, err error) {
+	gasCost := p.RequiredGas(state, input)
+	if suppliedGas < gasCost {
+		return nil, 0, ErrOutOfGas
+	}
+	if logger != nil && logger.OnGasChange != nil {
+		logger.OnGasChange(suppliedGas, suppliedGas-gasCost, tracing.GasChangeCallPrecompiledContract)
+	}
+	suppliedGas -= gasCost
+	output, err := p.Run(state, input)
+	return output, suppliedGas, err
+}
+
+// journalRecordsContract is a stateful precompile for querying transaction journal records.
+type journalRecordsContract struct{}
+
+const (
+	journalBalancesField  uint8 = 0x1
+	journalStorageField   uint8 = 0x2
+	journalCountOperation uint8 = 0x1
+	journalListOperation  uint8 = 0x2
+)
+
+const (
+	journalBaseCost     uint64 = 100
+	journalCountCost    uint64 = 50
+	journalGetBaseCost  uint64 = 100
+	journalPerDeltaCost uint64 = 10
+)
+
+func (c *journalRecordsContract) RequiredGas(sdb StateDB, input []byte) uint64 {
+	if len(input) < 2 {
+		return journalBaseCost
+	}
+	if input[1] == journalCountOperation {
+		return journalBaseCost + journalCountCost
+	}
+	hsdb, ok := sdb.(interface{ BuildJournalRecords() *state.JournalRecords })
+	if !ok {
+		return journalBaseCost
+	}
+	records := hsdb.BuildJournalRecords()
+	var count int
+	switch input[0] {
+	case journalBalancesField:
+		count = len(records.BalanceDeltas)
+	case journalStorageField:
+		count = len(records.StorageDeltas)
+	default:
+		return journalBaseCost
+	}
+	return journalBaseCost + journalGetBaseCost + uint64(count)*journalPerDeltaCost
+}
+
+func (c *journalRecordsContract) Run(sdb StateDB, input []byte) ([]byte, error) {
+	if len(input) < 2 {
+		return nil, errors.New("input too short")
+	}
+	field, operation := input[0], input[1]
+	if field != journalBalancesField && field != journalStorageField {
+		return nil, errors.New("invalid field")
+	}
+	if operation != journalCountOperation && operation != journalListOperation {
+		return nil, errors.New("invalid operation")
+	}
+	hsdb, ok := sdb.(interface{ BuildJournalRecords() *state.JournalRecords })
+	if !ok {
+		return nil, errors.New("unsupported StateDB")
+	}
+	records := hsdb.BuildJournalRecords()
+	switch operation {
+	case journalCountOperation:
+		return c.count(records, field), nil
+	case journalListOperation:
+		return c.list(records, field), nil
+	}
+	return nil, errors.New("invalid operation")
+}
+
+func (c *journalRecordsContract) count(records *state.JournalRecords, field uint8) []byte {
+	var n uint64
+	switch field {
+	case journalBalancesField:
+		n = uint64(len(records.BalanceDeltas))
+	case journalStorageField:
+		n = uint64(len(records.StorageDeltas))
+	}
+	result := make([]byte, 32)
+	for i := 0; i < 8; i++ {
+		result[31-i] = byte(n >> (8 * i))
+	}
+	return result
+}
+
+func (c *journalRecordsContract) list(records *state.JournalRecords, field uint8) []byte {
+	switch field {
+	case journalBalancesField:
+		return records.EncodeBalanceDeltas()
+	case journalStorageField:
+		return records.EncodeStorageDeltas()
+	}
+	return nil
+}
+
+func (c *journalRecordsContract) Name() string {
+	return "JOURNAL"
 }

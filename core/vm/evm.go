@@ -46,6 +46,11 @@ func (evm *EVM) precompile(addr common.Address) (PrecompiledContract, bool) {
 	return p, ok
 }
 
+func (evm *EVM) statefulPrecompile(addr common.Address) (StatefulPrecompiledContract, bool) {
+	p, ok := evm.statefulPrecompiles[addr]
+	return p, ok
+}
+
 // BlockContext provides the EVM with auxiliary information. Once provided
 // it shouldn't be modified.
 type BlockContext struct {
@@ -122,6 +127,9 @@ type EVM struct {
 	// precompiles holds the precompiled contracts for the current epoch
 	precompiles map[common.Address]PrecompiledContract
 
+	// statefulPrecompiles holds precompiles that need EVM state access
+	statefulPrecompiles StatefulPrecompiledContracts
+
 	// jumpDests stores results of JUMPDEST analysis.
 	jumpDests JumpDestCache
 
@@ -147,6 +155,7 @@ func NewEVM(blockCtx BlockContext, statedb StateDB, chainConfig *params.ChainCon
 		hasher:      crypto.NewKeccakState(),
 	}
 	evm.precompiles = activePrecompiledContracts(evm.chainRules)
+	evm.statefulPrecompiles = DefaultStatefulPrecompiles
 
 	switch {
 	case evm.chainRules.IsOsaka:
@@ -256,9 +265,10 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 	}
 	snapshot := evm.StateDB.Snapshot()
 	p, isPrecompile := evm.precompile(addr)
+	sp, isStatefulPrecompile := evm.statefulPrecompile(addr)
 
 	if !evm.StateDB.Exist(addr) {
-		if !isPrecompile && evm.chainRules.IsEIP4762 && !isSystemCall(caller) {
+		if !isPrecompile && !isStatefulPrecompile && evm.chainRules.IsEIP4762 && !isSystemCall(caller) {
 			// Add proof of absence to witness
 			// At this point, the read costs have already been charged, either because this
 			// is a direct tx call, in which case it's covered by the intrinsic gas, or because
@@ -274,7 +284,7 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 			gas -= wgas
 		}
 
-		if !isPrecompile && evm.chainRules.IsEIP158 && value.IsZero() {
+		if !isPrecompile && !isStatefulPrecompile && evm.chainRules.IsEIP158 && value.IsZero() {
 			// Calling a non-existing account, don't do anything.
 			return nil, gas, nil
 		}
@@ -284,9 +294,12 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 
 	if isPrecompile {
 		ret, gas, err = RunPrecompiledContract(p, input, gas, evm.Config.Tracer)
+	} else if isStatefulPrecompile {
+		ret, gas, err = RunStatefulPrecompiledContract(sp, evm.StateDB, input, gas, evm.Config.Tracer)
 	} else {
 		// Initialise a new contract and set the code that is to be used by the EVM.
 		code := evm.resolveCode(addr)
+
 		if len(code) == 0 {
 			ret, err = nil, nil // gas is unchanged
 		} else {
@@ -348,6 +361,8 @@ func (evm *EVM) CallCode(caller common.Address, addr common.Address, input []byt
 	// It is allowed to call precompiles, even via delegatecall
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
 		ret, gas, err = RunPrecompiledContract(p, input, gas, evm.Config.Tracer)
+	} else if sp, isStatefulPrecompile := evm.statefulPrecompile(addr); isStatefulPrecompile {
+		ret, gas, err = RunStatefulPrecompiledContract(sp, evm.StateDB, input, gas, evm.Config.Tracer)
 	} else {
 		// Initialise a new contract and set the code that is to be used by the EVM.
 		// The contract is a scoped environment for this execution context only.
@@ -391,6 +406,8 @@ func (evm *EVM) DelegateCall(originCaller common.Address, caller common.Address,
 	// It is allowed to call precompiles, even via delegatecall
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
 		ret, gas, err = RunPrecompiledContract(p, input, gas, evm.Config.Tracer)
+	} else if sp, isStatefulPrecompile := evm.statefulPrecompile(addr); isStatefulPrecompile {
+		ret, gas, err = RunStatefulPrecompiledContract(sp, evm.StateDB, input, gas, evm.Config.Tracer)
 	} else {
 		// Initialise a new contract and make initialise the delegate values
 		//
@@ -443,6 +460,8 @@ func (evm *EVM) StaticCall(caller common.Address, addr common.Address, input []b
 
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
 		ret, gas, err = RunPrecompiledContract(p, input, gas, evm.Config.Tracer)
+	} else if sp, isStatefulPrecompile := evm.statefulPrecompile(addr); isStatefulPrecompile {
+		ret, gas, err = RunStatefulPrecompiledContract(sp, evm.StateDB, input, gas, evm.Config.Tracer)
 	} else {
 		// Initialise a new contract and set the code that is to be used by the EVM.
 		// The contract is a scoped environment for this execution context only.

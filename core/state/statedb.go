@@ -151,7 +151,6 @@ type StateDB struct {
 	StorageCommits  time.Duration
 	SnapshotCommits time.Duration
 	TrieDBCommits   time.Duration
-	CodeReads       time.Duration
 
 	AccountLoaded  int          // Number of accounts retrieved from the database during the state transition
 	AccountUpdated int          // Number of accounts updated during the state transition
@@ -159,7 +158,6 @@ type StateDB struct {
 	StorageLoaded  int          // Number of storage slots retrieved from the database during the state transition
 	StorageUpdated atomic.Int64 // Number of storage slots updated during the state transition
 	StorageDeleted atomic.Int64 // Number of storage slots deleted during the state transition
-	CodeLoaded     int          // Number of contract code loaded during the state transition
 }
 
 // New creates a new state from a given trie.
@@ -1319,16 +1317,11 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool, blockNum
 
 // commitAndFlush is a wrapper of commit which also commits the state mutations
 // to the configured data stores.
-func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorageWiping bool, dedupCode bool) (*stateUpdate, error) {
+func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (*stateUpdate, error) {
 	ret, err := s.commit(deleteEmptyObjects, noStorageWiping, block)
 	if err != nil {
 		return nil, err
 	}
-
-	if dedupCode {
-		ret.markCodeExistence(s.reader)
-	}
-
 	// Commit dirty contract code if any exists
 	if db := s.db.TrieDB().Disk(); db != nil && len(ret.codes) > 0 {
 		batch := db.NewBatch()
@@ -1383,21 +1376,21 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 // no empty accounts left that could be deleted by EIP-158, storage wiping
 // should not occur.
 func (s *StateDB) Commit(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (common.Hash, error) {
-	ret, err := s.commitAndFlush(block, deleteEmptyObjects, noStorageWiping, false)
+	ret, err := s.commitAndFlush(block, deleteEmptyObjects, noStorageWiping)
 	if err != nil {
 		return common.Hash{}, err
 	}
 	return ret.root, nil
 }
 
-// CommitAndTrack writes the state mutations and notifies the size tracker of the state changes.
-func (s *StateDB) CommitAndTrack(block uint64, deleteEmptyObjects bool, noStorageWiping bool, sizer *SizeTracker) (common.Hash, error) {
-	ret, err := s.commitAndFlush(block, deleteEmptyObjects, noStorageWiping, true)
+// CommitWithUpdate writes the state mutations and returns both the root hash and the state update.
+// This is useful for tracking state changes at the blockchain level.
+func (s *StateDB) CommitWithUpdate(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (common.Hash, *stateUpdate, error) {
+	ret, err := s.commitAndFlush(block, deleteEmptyObjects, noStorageWiping)
 	if err != nil {
-		return common.Hash{}, err
+		return common.Hash{}, nil, err
 	}
-	sizer.Notify(ret)
-	return ret.root, nil
+	return ret.root, ret, nil
 }
 
 // Prepare handles the preparatory steps for executing a state transition with.
@@ -1507,4 +1500,18 @@ func (s *StateDB) Witness() *stateless.Witness {
 
 func (s *StateDB) AccessEvents() *AccessEvents {
 	return s.accessEvents
+}
+
+// BuildJournalRecords constructs journal records by parsing journal entries.
+func (s *StateDB) BuildJournalRecords() *JournalRecords {
+	records := newJournalRecords()
+	for _, entry := range s.journal.entries {
+		switch e := entry.(type) {
+		case balanceChange:
+			records.addBalanceDelta(e.account, s.GetBalance(e.account))
+		case storageChange:
+			records.addStorageDelta(e.account, e.key, s.GetState(e.account, e.key))
+		}
+	}
+	return records
 }

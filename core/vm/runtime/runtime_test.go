@@ -37,6 +37,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/eth/tracers/logger"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 
 	// force-load js tracers to trigger registration
 	_ "github.com/ethereum/go-ethereum/eth/tracers/js"
@@ -124,6 +125,241 @@ func TestCall(t *testing.T) {
 	num := new(big.Int).SetBytes(ret)
 	if num.Cmp(big.NewInt(10)) != 0 {
 		t.Error("Expected 10, got", num)
+	}
+}
+
+// Journal precompile constants (must match contracts.go)
+const (
+	journalBalancesField  byte = 0x1
+	journalStorageField   byte = 0x2
+	journalCountOperation byte = 0x1
+	journalListOperation  byte = 0x2
+)
+
+var journalRecordsAddress = common.HexToAddress("0xc0ffee")
+
+func TestJournalRecordsInvalidInput(t *testing.T) {
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+
+	// Test with no input (should error)
+	_, _, err := Call(journalRecordsAddress, nil, &Config{State: statedb})
+	if err == nil {
+		t.Fatal("expected error for missing input header")
+	}
+
+	// Test with only 1 byte (should error)
+	_, _, err = Call(journalRecordsAddress, []byte{0x1}, &Config{State: statedb})
+	if err == nil {
+		t.Fatal("expected error for incomplete input header")
+	}
+
+	// Test with invalid field parameter
+	_, _, err = Call(journalRecordsAddress, []byte{0x99, journalCountOperation}, &Config{State: statedb})
+	if err == nil {
+		t.Fatal("expected error for invalid field parameter")
+	}
+
+	// Test with invalid operation parameter
+	_, _, err = Call(journalRecordsAddress, []byte{journalBalancesField, 0x99}, &Config{State: statedb})
+	if err == nil {
+		t.Fatal("expected error for invalid operation parameter")
+	}
+}
+
+func TestJournalRecordsEmpty(t *testing.T) {
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+
+	// Test COUNT operation for balances
+	input := []byte{journalBalancesField, journalCountOperation}
+	ret, _, err := Call(journalRecordsAddress, input, &Config{State: statedb})
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	if len(ret) != 32 {
+		t.Fatalf("expected 32 bytes for count, got %d bytes", len(ret))
+	}
+	balanceCount := new(big.Int).SetBytes(ret)
+	if balanceCount.Cmp(big.NewInt(0)) != 0 {
+		t.Errorf("expected 0 balance deltas, got %v", balanceCount)
+	}
+
+	// Test COUNT operation for storage
+	input = []byte{journalStorageField, journalCountOperation}
+	ret, _, err = Call(journalRecordsAddress, input, &Config{State: statedb})
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	storageCount := new(big.Int).SetBytes(ret)
+	if storageCount.Cmp(big.NewInt(0)) != 0 {
+		t.Errorf("expected 0 storage deltas, got %v", storageCount)
+	}
+
+	// Test LIST operation for balances (empty list = 0 bytes)
+	input = []byte{journalBalancesField, journalListOperation}
+	ret, _, err = Call(journalRecordsAddress, input, &Config{State: statedb})
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+	if len(ret) != 0 {
+		t.Fatalf("expected 0 bytes for empty list, got %d bytes", len(ret))
+	}
+}
+
+func TestJournalRecordsStaticCall(t *testing.T) {
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+
+	// Create a contract that will STATICCALL the journal records precompile
+	// Input: [0x01, 0x01] = BALANCES_FIELD, COUNT_OPERATION
+	// Returns 32 bytes (the count)
+	caller := common.HexToAddress("0xc0de")
+	callerCode := []byte{
+		// Store input header in memory at offset 0
+		byte(vm.PUSH2), 0x01, 0x01, // input: field=1, operation=1
+		byte(vm.PUSH1), 0x00, // memory offset
+		byte(vm.MSTORE), // store at offset 0 (right-aligned in 32-byte word)
+		// STATICCALL
+		byte(vm.PUSH1), 0x20, // return size (32 bytes)
+		byte(vm.PUSH1), 0x00, // return offset
+		byte(vm.PUSH1), 0x02, // args size (2 bytes for header)
+		byte(vm.PUSH1), 0x1e, // args offset (30, since MSTORE right-aligns)
+		byte(vm.PUSH20), // journal records address
+	}
+	callerCode = append(callerCode, journalRecordsAddress.Bytes()...)
+	callerCode = append(callerCode,
+		byte(vm.GAS),
+		byte(vm.STATICCALL),
+		byte(vm.POP),
+		byte(vm.PUSH1), 0x20, // size (32 bytes)
+		byte(vm.PUSH1), 0x00, // offset
+		byte(vm.PUSH1), 0x00, // destOffset
+		byte(vm.RETURNDATACOPY),
+		byte(vm.PUSH1), 0x20, // size
+		byte(vm.PUSH1), 0x00, // offset
+		byte(vm.RETURN),
+	)
+	statedb.SetCode(caller, callerCode, tracing.CodeChangeUnspecified)
+
+	ret, _, err := Call(caller, nil, &Config{State: statedb})
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	// Expect 32 bytes with zero count (no state changes)
+	if len(ret) != 32 {
+		t.Fatalf("expected 32 bytes return, got %d bytes", len(ret))
+	}
+
+	balanceCount := new(big.Int).SetBytes(ret)
+	if balanceCount.Cmp(big.NewInt(0)) != 0 {
+		t.Errorf("expected 0 balance deltas, got %v", balanceCount)
+	}
+}
+
+func TestJournalRecordsWithBalanceChange(t *testing.T) {
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	testAddr := common.HexToAddress("0x1234")
+	testBalance := uint256.NewInt(1000000)
+	statedb.AddBalance(testAddr, testBalance, tracing.BalanceChangeUnspecified)
+
+	// Test COUNT operation for balances
+	input := []byte{journalBalancesField, journalCountOperation}
+	ret, _, err := Call(journalRecordsAddress, input, &Config{State: statedb})
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	balanceCount := new(big.Int).SetBytes(ret).Int64()
+	if balanceCount != 1 {
+		t.Errorf("expected 1 balance delta, got %d", balanceCount)
+	}
+
+	// Test LIST operation for balances
+	input = []byte{journalBalancesField, journalListOperation}
+	ret, _, err = Call(journalRecordsAddress, input, &Config{State: statedb})
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	// Each balance delta is 64 bytes: address (32) + value (32)
+	if len(ret) != 64 {
+		t.Errorf("expected 64 bytes, got %d", len(ret))
+	}
+
+	// Parse address (right-aligned in first 32 bytes)
+	deltaAddr := common.BytesToAddress(ret[12:32])
+	if deltaAddr != testAddr {
+		t.Errorf("expected address %s, got %s", testAddr.Hex(), deltaAddr.Hex())
+	}
+
+	// Parse value
+	deltaValue := new(big.Int).SetBytes(ret[32:64])
+	if deltaValue.Cmp(new(big.Int).SetUint64(1000000)) != 0 {
+		t.Errorf("expected delta value 1000000, got %v", deltaValue)
+	}
+
+	// Verify storage count is 0
+	input = []byte{journalStorageField, journalCountOperation}
+	ret, _, err = Call(journalRecordsAddress, input, &Config{State: statedb})
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+	storageCount := new(big.Int).SetBytes(ret).Int64()
+	if storageCount != 0 {
+		t.Errorf("expected 0 storage deltas, got %d", storageCount)
+	}
+}
+
+func TestJournalRecordsWithStorageChange(t *testing.T) {
+	// Test that storage changes are captured in journal records
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+
+	// Create account and set storage
+	testAddr := common.HexToAddress("0x5678")
+	statedb.CreateAccount(testAddr)
+	key := common.HexToHash("0x1")
+	value := common.HexToHash("0xdeadbeef")
+	statedb.SetState(testAddr, key, value)
+
+	// Test COUNT operation for storage
+	input := []byte{journalStorageField, journalCountOperation}
+	ret, _, err := Call(journalRecordsAddress, input, &Config{State: statedb})
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	storageCount := new(big.Int).SetBytes(ret).Int64()
+	if storageCount != 1 {
+		t.Errorf("expected 1 storage delta, got %d", storageCount)
+	}
+
+	// Test LIST operation for storage
+	input = []byte{journalStorageField, journalListOperation}
+	ret, _, err = Call(journalRecordsAddress, input, &Config{State: statedb})
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	// Each storage delta is 96 bytes: address (32) + key (32) + value (32)
+	if len(ret) != 96 {
+		t.Errorf("expected 96 bytes, got %d", len(ret))
+	}
+
+	// Parse address (right-aligned in first 32 bytes)
+	deltaAddr := common.BytesToAddress(ret[12:32])
+	if deltaAddr != testAddr {
+		t.Errorf("expected address %s, got %s", testAddr.Hex(), deltaAddr.Hex())
+	}
+
+	deltaKey := common.BytesToHash(ret[32:64])
+	if deltaKey != key {
+		t.Errorf("expected key %s, got %s", key.Hex(), deltaKey.Hex())
+	}
+
+	deltaValue := common.BytesToHash(ret[64:96])
+	if deltaValue != value {
+		t.Errorf("expected delta value %s, got %s", value.Hex(), deltaValue.Hex())
 	}
 }
 
