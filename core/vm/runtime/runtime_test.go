@@ -293,10 +293,10 @@ func TestJournalRecordsWithBalanceChange(t *testing.T) {
 		t.Errorf("expected address %s, got %s", testAddr.Hex(), deltaAddr.Hex())
 	}
 
-	// Parse value
+	// Parse value (this is the PREVIOUS balance, which was 0 before AddBalance)
 	deltaValue := new(big.Int).SetBytes(ret[32:64])
-	if deltaValue.Cmp(new(big.Int).SetUint64(1000000)) != 0 {
-		t.Errorf("expected delta value 1000000, got %v", deltaValue)
+	if deltaValue.Cmp(big.NewInt(0)) != 0 {
+		t.Errorf("expected previous balance 0, got %v", deltaValue)
 	}
 
 	// Verify storage count is 0
@@ -357,9 +357,11 @@ func TestJournalRecordsWithStorageChange(t *testing.T) {
 		t.Errorf("expected key %s, got %s", key.Hex(), deltaKey.Hex())
 	}
 
+	// Parse value (this is the PREVIOUS storage value, which was 0x0 before SetState)
 	deltaValue := common.BytesToHash(ret[64:96])
-	if deltaValue != value {
-		t.Errorf("expected delta value %s, got %s", value.Hex(), deltaValue.Hex())
+	expectedPrev := common.Hash{} // zero hash
+	if deltaValue != expectedPrev {
+		t.Errorf("expected previous storage value %s, got %s", expectedPrev.Hex(), deltaValue.Hex())
 	}
 }
 

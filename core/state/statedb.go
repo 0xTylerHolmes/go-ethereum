@@ -1509,16 +1509,24 @@ func (s *StateDB) AccessEvents() *AccessEvents {
 	return s.accessEvents
 }
 
-// BuildJournalRecords constructs journal records by parsing journal entries.
-func (s *StateDB) BuildJournalRecords() *JournalRecords {
-	records := newJournalRecords()
+func (s *StateDB) JournalEntries() []JournalEntry {
+	var entries []JournalEntry
+
 	for _, entry := range s.journal.entries {
 		switch e := entry.(type) {
 		case balanceChange:
-			records.addBalanceDelta(e.account, s.GetBalance(e.account))
+			entries = append(entries, &BalanceChange{
+				Account: e.account,
+				Prev:    e.prev.Clone(),
+			})
 		case storageChange:
-			records.addStorageDelta(e.account, e.key, s.GetState(e.account, e.key))
+			entries = append(entries, &StorageChange{
+				Account: e.account,
+				Key:     e.key,
+				Prev:    e.prevvalue,
+			})
 		}
 	}
-	return records
+
+	return entries
 }
